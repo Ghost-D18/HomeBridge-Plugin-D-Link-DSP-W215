@@ -1,0 +1,19 @@
+{
+  "name": "homebridge-dlink",
+  "version": "1.0.0",
+  "description": "Plugin custom per la presa D-Link DSP-W115",
+  "main": "index.js",
+  "keywords": [
+    "homebridge-plugin"
+  ],
+  "author": "Il Tuo Nome",
+  "license": "ISC",
+  "engines": {
+    "node": ">=12.0.0",
+    "homebridge": ">=0.4.45"
+  },
+  "dependencies": {
+    "dlink_websocketclient": "^0.5.5",
+    "telnet-client": "^2.2.5"
+  }
+}
