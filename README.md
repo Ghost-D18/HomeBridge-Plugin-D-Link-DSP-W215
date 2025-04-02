@@ -13,14 +13,17 @@ The plugin use the telnet to get the token periodically in auto mode and because
 ## Configuration sample
 When you install the plugin, you have to manually write the config piece.
 This one is the base:
-``javascript{
+```json
+{
 	"accessory":  "DLinkSmartPlug",
 	"name":  "NAME OF THE ACCESSORY",
 	"ip":  "YOUR PLUG'S IP",
 	"pin":  "TELNET",
 	"useTelnetForToken":  true,
 	"simulateError":  true
-}``
+}
+```
+
 **You have to modify ONLY "name" and "ip"**
 
 -   `**name**`: The name you want to assign to the accessory.
