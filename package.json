@@ -5,7 +5,7 @@
   "main": "index.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tuo-username/mio-repo.git"
+    "url": "https://github.com/Ghost-D18/HomeBridge-Plugin-D-Link-DSP-W215"
   },
   "keywords": [
     "homebridge-plugin"
