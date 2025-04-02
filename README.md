@@ -15,12 +15,12 @@ When you install the plugin, you have to manually write the config piece.
 This one is the base:
 ```json
 {
-	"accessory":  "DLinkSmartPlug",
-	"name":  "NAME OF THE ACCESSORY",
-	"ip":  "YOUR PLUG'S IP",
-	"pin":  "TELNET",
-	"useTelnetForToken":  true,
-	"simulateError":  true
+	"accessory": "DLinkSmartPlug",
+	"name": "NAME OF THE ACCESSORY",
+	"ip": "YOUR PLUG'S IP",
+	"pin": "TELNET",
+	"useTelnetForToken": true,
+	"simulateError": true
 }
 ```
 
