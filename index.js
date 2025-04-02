@@ -12,7 +12,7 @@ class DLinkSmartPlug {
     this.log = log;
     this.name = config.name || "D-Link Smart Plug";
     this.ip = config.ip;
-    this.pin = config.pin; // Inserisci qui il PIN o il token fisso (usa "TELNET" se vuoi aggiornare automaticamente)
+    this.pin = config.pin; // Enter the PIN or fixed token here (use "TELNET" if you want to update automatically)
     this.useTelnetForToken = config.useTelnetForToken || false;
     
     this.options = {
@@ -21,27 +21,27 @@ class DLinkSmartPlug {
       useTelnetForToken: this.useTelnetForToken
     };
 
-    this.log(`Inizializzazione della presa '${this.name}' su IP ${this.ip} con opzioni: ${JSON.stringify(this.options)}`);
+    this.log(`Initializing plug '${this.name}' on IP ${this.ip} with options: ${JSON.stringify(this.options)}`);
     this.client = new WebSocketClient(this.options);
     
-    // Se l'opzione per aggiornamento automatico è abilitata, avvia l'intervallo
+    // If the option for automatic update is enabled, start the interval
     if (this.useTelnetForToken) {
       this.startTokenUpdateInterval();
     }
   }
 
   startTokenUpdateInterval() {
-    // Aggiorna il token ogni 1 secondo (1000 ms)
+    // Update the token every 1 second (1000 ms)
     this.tokenUpdateInterval = setInterval(() => {
       if (this.tokenUpdateInProgress) return;
       this.tokenUpdateInProgress = true;
       this.client.getTokenFromTelnet()
         .then(newToken => {
           this.client.setPin(newToken);
-          // Non stampiamo il token per non appesantire il log
+          // We do not print the token to avoid cluttering the log
         })
         .catch(error => {
-          this.log("Errore nell'aggiornamento del token:", error);
+          this.log("Error updating token:", error);
         })
         .finally(() => {
           this.tokenUpdateInProgress = false;
@@ -61,28 +61,28 @@ class DLinkSmartPlug {
     try {
       await this.client.login();
       const state = await this.client.state();
-      this.log(`Stato attuale della presa '${this.name}': ${state ? "Accesa" : "Spenta"}`);
+      this.log(`Current state of plug '${this.name}': ${state ? "On" : "Off"}`);
       callback(null, state);
     } catch (error) {
-      this.log("Errore nel recuperare lo stato:", error);
-      // Se l'errore è quello che serve per riprendere il token (API Error 424) lo gestiamo normalmente
+      this.log("Error retrieving state:", error);
+      // If the error requires token retrieval (API Error 424), handle it normally
       if (error.code === 424 || (error.message && error.message.includes("invalid device token"))) {
-        this.log("API Error 424 rilevato: token non valido. Forzo riconnessione...");
+        this.log("API Error 424 detected: invalid token. Forcing reconnection...");
         try {
           this.client = new WebSocketClient(this.options);
           await this.client.login();
           const state = await this.client.state();
-          this.log(`Dopo riconnessione, stato della presa '${this.name}': ${state ? "Accesa" : "Spenta"}`);
+          this.log(`After reconnection, plug '${this.name}' state: ${state ? "On" : "Off"}`);
           callback(null, state);
         } catch (forcedError) {
-          this.log("Errore durante il tentativo forzato di riconnessione:", forcedError);
-          // Per ogni errore in questa gestione, forziamo il riavvio del processo
+          this.log("Error during forced reconnection attempt:", forcedError);
+          // For any error in this handling, force a process restart
           setTimeout(() => { process.exit(1); }, 1000);
           callback(forcedError);
         }
       } else {
-        // Per ogni altro errore, forziamo il riavvio dell'intero processo Homebridge
-        this.log("Errore non gestito rilevato. Riavvio il plugin...");
+        // For any other error, force a restart of the entire Homebridge process
+        this.log("Unhandled error detected. Restarting the plugin...");
         setTimeout(() => { process.exit(1); }, 1000);
         callback(error);
       }
@@ -93,13 +93,13 @@ class DLinkSmartPlug {
     try {
       await this.client.login();
       await this.client.switch(value);
-      this.log(`Imposto lo stato della presa '${this.name}' a: ${value ? "Accesa" : "Spenta"}`);
+      this.log(`Setting plug '${this.name}' state to: ${value ? "On" : "Off"}`);
       callback(null);
     } catch (error) {
-      this.log("Errore nel cambiare lo stato:", error);
-      // Se l'errore non è quello per cui abbiamo implementato la riconnessione del token, riavviamo
+      this.log("Error changing state:", error);
+      // If the error is not related to token reconnection, restart the plugin
       if (!(error.code === 424 || (error.message && error.message.includes("invalid device token")))) {
-        this.log("Errore non gestito durante il cambio stato. Riavvio il plugin...");
+        this.log("Unhandled error during state change. Restarting the plugin...");
         setTimeout(() => { process.exit(1); }, 1000);
       }
       callback(error);
