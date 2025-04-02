@@ -1,7 +1,7 @@
 {
   "name": "homebridge-dlink-dsp-w215-control",
   "version": "1.0.0",
-  "description": "Custom plugin for controlling D-Link DSP-W115",
+  "description": "Custom plugin for controlling D-Link DSP-W215",
   "main": "index.js",
   "repository": {
     "type": "git",
