@@ -8,7 +8,7 @@
 
 This **Homebridge D-Link Plugin** enable you to integrate D-Link smart plug DSP W215 with Homebridge, enabling it to be controlled and monitoring its status. You can turn the smart plug on and off and check the status.
 The base of this plugin was given by this great guy @Garfonso: https://github.com/Garfonso/dlinkWebSocketClient. For configuration, problem or more details go to his git.
-The plugin use the telnet to get the token periodically in auto mode and because of an error, every time a specific token invalid error occur, the code try to get again the token.I n fact you will see a lot of message in the consol, every time need to update the status of the plug. In some cases when other type of error, instead of block the plugin, and so the plug isn't more accessible, the code restart whole Homebridge, like when you save the JSON config.
+The plugin use the telnet to get the token periodically in auto mode and because of an error, every time a specific token invalid error occur, the code try to get again the token. In fact you will see a lot of message in the consol, every time need to update the status of the plug. In some cases when other type of error occur, instead of blocking the plugin and so the plug isn't more accessible, the code restart whole Homebridge, like when you save the JSON config.
 
 ## Configuration sample
 When you install the plugin, you have to manually write the config piece.
@@ -36,4 +36,11 @@ This one is the base:
 
 - The plugin is not optmized at 100%, in fact it has some "problem". **The device must be configurated with token and not PIN** follow the guide on https://github.com/Garfonso/dlinkWebSocketClient, but with this configuration, you can control it through the official app.
 
-- You may not able to configure the smar plug correctly, in that case go the git linked and view some missing steps. In other case, get a little help by GPT (I was able to tell it to create a plugin, so you can resolve these problem I think).
+- You may not able to configure the smart plug correctly, in that case, go to the git linked and view some missing steps. In other case, get a little help by GPT (I was able to tell it to create a plugin, so you can resolve these problem I think).
+
+
+## P.S.
+I'm missing something important to tell you probably.
+If you want to do some changes, you are free to do it.
+I don't think I'll update this plugin. For now, for me, for the things I've to do, it work well.
+Sorry for my english btw.
