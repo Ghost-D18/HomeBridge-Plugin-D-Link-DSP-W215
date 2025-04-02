@@ -4,7 +4,7 @@ let Service, Characteristic;
 module.exports = (homebridge) => {
   Service = homebridge.hap.Service;
   Characteristic = homebridge.hap.Characteristic;
-  homebridge.registerAccessory("homebridge-dlink-dsp-w215-controll", "DLinkSmartPlug", DLinkSmartPlug);
+  homebridge.registerAccessory("homebridge-dlink-dsp-w215-control", "DLinkSmartPlug", DLinkSmartPlug);
 };
 
 class DLinkSmartPlug {
