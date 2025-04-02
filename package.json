@@ -1,5 +1,5 @@
 {
-  "name": "homebridge-dlink",
+  "name": "homebridge-dlink-dsp-w215",
   "version": "1.0.0",
   "description": "Plugin custom per la presa D-Link DSP-W115",
   "main": "index.js",
@@ -10,8 +10,8 @@
   "keywords": [
     "homebridge-plugin"
   ],
-  "author": "Il Tuo Nome",
-  "license": "ISC",
+  "author": "Ghost-D18",
+  "license": "MIT",
   "engines": {
     "node": ">=12.0.0",
     "homebridge": ">=0.4.45"
