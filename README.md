@@ -12,7 +12,6 @@ The plugin use the telnet to get the token periodically in auto mode and because
 
 ## Cons
 
-- The plugin is not optmized at 100%, in fact it has some "problem".
---**The device must be configurated with token and not PIN** follow the guide on https://github.com/Garfonso/dlinkWebSocketClient, but with this configuration, you can control it through the official app.
+- The plugin is not optmized at 100%, in fact it has some "problem". **The device must be configurated with token and not PIN** follow the guide on https://github.com/Garfonso/dlinkWebSocketClient, but with this configuration, you can control it through the official app.
 
 - You may not able to configure the smar plug correctly, in that case go the git linked and view some missing steps. In other case, get a little help by GPT (I was able to tell it to create a plugin, so you can resolve these problem I think).
