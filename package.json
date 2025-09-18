@@ -1,6 +1,6 @@
 {
   "name": "homebridge-dlink-wifi-smart-plug-dsp-w215",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Custom plugin for controlling D-Link DSP-W215 Wi-Fi Smart Plug",
   "main": "index.js",
   "repository": {
