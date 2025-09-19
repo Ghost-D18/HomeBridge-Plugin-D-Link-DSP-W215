@@ -1,9 +1,11 @@
-// homebridge-dlink-wifi-smart-plug-dsp-w215 (ottimizzato)
-// Principali miglioramenti:
-// - gestione centralizzata degli accessi/login con retry + backoff
-// - refresh token solo quando serve e intervallo configurabile
-// - meno riavvii di Homebridge (configurabile)
-// - serializzazione delle operazioni per evitare race conditions
+// homebridge-dlink-wifi-smart-plug-dsp-w215 (carefully optimized, English comments)
+// Key improvements:
+// - centralized login with retry + exponential backoff (serializes concurrent logins)
+// - periodic/explicit token refresh only when configured (telnet-based token retrieval)
+// - operation serialization (queue) to avoid race conditions between get/set
+// - configurable debug flag to control console verbosity (default off -> only warnings/errors)
+// - avoid Homebridge process restarts except when forceRestartOnFailure=true and on critical failures
+// - safe callback handling and defensive programming (no unhandled promise rejections)
 
 const WebSocketClient = require('dlink_websocketclient');
 let Service, Characteristic;
@@ -15,266 +17,382 @@ module.exports = (homebridge) => {
 };
 
 class DLinkSmartPlug {
-  constructor(log, config) {
+  constructor(log, config = {}) {
+    // Basic identity
     this.log = log;
     this.name = config.name || "D-Link Smart Plug";
     this.ip = config.ip;
-    this.pin = config.pin; // PIN / token oppure "TELNET"
-    this.useTelnetForToken = config.useTelnetForToken || false;
+    this.pin = config.pin; // token or "TELNET"
+    this.useTelnetForToken = !!config.useTelnetForToken;
 
-    // Config ottimizzazione
+    // User-configurable options with sensible defaults
     this.options = {
       ip: this.ip,
       pin: this.pin,
       useTelnetForToken: this.useTelnetForToken
     };
 
-    this.maxRetries = config.maxRetries || 5;
-    this.initialRetryDelayMs = config.initialRetryDelayMs || 1000; // 1s
-    this.forceRestartOnFailure = config.forceRestartOnFailure || false; // mantiene vecchio comportamento se true
-    // default token update ogni 5 minuti = 300000 ms (non 1s)
-    this.tokenUpdateIntervalMs = config.tokenUpdateIntervalMs || 300000;
+    this.maxRetries = Number.isInteger(config.maxRetries) ? config.maxRetries : 5;
+    this.initialRetryDelayMs = Number.isInteger(config.initialRetryDelayMs) ? config.initialRetryDelayMs : 1000; // 1s
+    this.tokenUpdateIntervalMs = Number.isInteger(config.tokenUpdateIntervalMs) ? config.tokenUpdateIntervalMs : 300000; // 5min default
+    this.forceRestartOnFailure = !!config.forceRestartOnFailure; // default false
 
-    this.log(`Initializing plug '${this.name}' on IP ${this.ip} (useTelnetForToken=${this.useTelnetForToken})`);
+    // Debug flag: if true show all the original plugin messages; if false show only warnings/errors
+    this.debug = !!config.debug;
 
+    // Internal state
     this.client = new WebSocketClient(this.options);
-
-    // Stato interno
     this.shutdownRequested = false;
-    this.loginPromise = null; // serializza i login
+    this.loginPromise = null; // serializes login operations
     this.tokenUpdateInProgress = false;
+    this.tokenUpdateInterval = null;
 
+    // Operation queue: serialize high-level operations (get/set) to avoid races
+    // Implemented as a chain of promises: this._opQueue = this._opQueue.then(() => op())
+    this._opQueue = Promise.resolve();
+
+    // Start periodic token refresh only if telnet-based token retrieval is enabled
     if (this.useTelnetForToken) {
-      this.startTokenUpdateInterval();
+      this._startTokenUpdateInterval();
+    }
+
+    this._logInfo(`Initializing D-Link Smart Plug '${this.name}' at ${this.ip} (telnetToken=${this.useTelnetForToken})`);
+  }
+
+  // ---------- Logging helpers ----------
+  _logDebug(...args) {
+    if (this.debug) this._nativeLog('debug', ...args);
+  }
+  _logInfo(...args) {
+    // minimal info: show only if debug enabled
+    if (this.debug) this._nativeLog('info', ...args);
+  }
+  _logWarn(...args) {
+    this._nativeLog('warn', ...args);
+  }
+  _logError(...args) {
+    this._nativeLog('error', ...args);
+  }
+  _nativeLog(level, ...args) {
+    // Homebridge log sometimes exposes .debug, but to be safe use the provided logger.
+    // We keep messages brief when debug=false (only warn/error).
+    try {
+      const message = args.map(a => (typeof a === 'string' ? a : (a && a.message ? a.message : JSON.stringify(a)))).join(' ');
+      if (level === 'debug' && typeof this.log.debug === 'function') return this.log.debug(message);
+      if (level === 'info' && typeof this.log.info === 'function') return this.log.info(message);
+      if (level === 'warn' && typeof this.log.warn === 'function') return this.log.warn(message);
+      if (level === 'error' && typeof this.log.error === 'function') return this.log.error(message);
+      // fallback
+      if (level === 'error') return this.log(`ERROR: ${message}`);
+      if (level === 'warn') return this.log(`WARN: ${message}`);
+      if (level === 'debug') return this.log(`DEBUG: ${message}`);
+      this.log(message);
+    } catch (e) {
+      // avoid throwing during logging
+      try { this.log('Logging error:', e && e.message ? e.message : e); } catch (_) { /* noop */ }
     }
   }
 
-  startTokenUpdateInterval() {
-    if (this.tokenUpdateInterval) return; // già attivo
-    // Aggiorniamo il token a intervalli ragionevoli configurabili (default 5 min)
+  // Small helper to classify token errors from different shapes of errors
+  _isTokenError(err) {
+    if (!err) return false;
+    const code = err.code;
+    const msg = (err && (err.message || err.toString())) || '';
+    const lower = String(msg).toLowerCase();
+    return code === 424 || lower.includes("invalid device token") || lower.includes("invalid token") || lower.includes("token expired");
+  }
+
+  // ---------- Operation queue ----------
+  // All external operations (get/set) should be serialized using this queue helper.
+  _enqueueOperation(fn) {
+    // fn should return a Promise
+    this._opQueue = this._opQueue.then(() => {
+      if (this.shutdownRequested) return Promise.reject(new Error("Accessory shutting down"));
+      return fn();
+    }).catch(err => {
+      // swallow to avoid breaking the chain; return rejection so caller knows
+      return Promise.reject(err);
+    });
+    return this._opQueue;
+  }
+
+  // ---------- Token refresh interval ----------
+  _startTokenUpdateInterval() {
+    if (this.tokenUpdateInterval) return;
+    // only when useTelnetForToken is true
     this.tokenUpdateInterval = setInterval(async () => {
-      if (this.tokenUpdateInProgress) return;
+      if (this.shutdownRequested) return;
+      if (this.tokenUpdateInProgress) {
+        this._logDebug("Periodic token refresh skipped: already in progress");
+        return;
+      }
       this.tokenUpdateInProgress = true;
       try {
-        this.log("Periodic token update: fetching token from telnet...");
+        this._logDebug("Periodic token update: fetching token from telnet...");
         const newToken = await this.client.getTokenFromTelnet();
         if (newToken) {
-          // Impostiamo il PIN sul client senza stamparlo in log
+          // set token safely, do NOT print token
           if (typeof this.client.setPin === 'function') {
             this.client.setPin(newToken);
+          } else if (typeof this.client.updatePin === 'function') {
+            this.client.updatePin(newToken);
           } else {
-            // se l'API è diversa, provare setPin o updatePin
-            if (typeof this.client.updatePin === 'function') {
-              this.client.updatePin(newToken);
-            }
+            this._logWarn("Client does not expose setPin/updatePin to update token.");
           }
-          this.log("Periodic token update: token updated (not shown in logs).");
+          this._logDebug("Periodic token update: token updated (not shown).");
         } else {
-          this.log("Periodic token update: telnet did not return a token.");
+          this._logWarn("Periodic token update: telnet did not return a token.");
         }
       } catch (err) {
-        this.log("Periodic token update error:", err && err.message ? err.message : err);
+        this._logWarn("Periodic token update error:", err && err.message ? err.message : err);
       } finally {
         this.tokenUpdateInProgress = false;
       }
     }, this.tokenUpdateIntervalMs);
   }
 
-  clearTokenUpdateInterval() {
+  _clearTokenUpdateInterval() {
     if (this.tokenUpdateInterval) {
       clearInterval(this.tokenUpdateInterval);
       this.tokenUpdateInterval = null;
     }
   }
 
-  // centralizza login con retry + backoff; serializza invocazioni concurrenti
+  // ---------- Login / connection handling ----------
+  // Serializes login attempts via this.loginPromise
   async ensureConnected() {
     if (this.shutdownRequested) throw new Error("Accessory shutting down");
 
-    // Se un login è già in corso, aspettiamo il suo risultato (serializzazione)
-    if (this.loginPromise) return this.loginPromise;
+    if (this.loginPromise) {
+      this._logDebug("Login already in progress, awaiting existing promise");
+      return this.loginPromise;
+    }
 
     this.loginPromise = (async () => {
       let attempt = 0;
       let delay = this.initialRetryDelayMs;
-      while (attempt < this.maxRetries) {
+
+      while (attempt < this.maxRetries && !this.shutdownRequested) {
         attempt++;
         try {
-          // prova a fare login
-          await this.client.login();
-          // login ok
-          this.log.debug ? this.log.debug(`Login riuscito al tentativo ${attempt}`) : this.log(`Login riuscito (tentativo ${attempt})`);
+          this._logDebug(`Attempting login (attempt ${attempt})`);
+          await this.client.login(); // assume client.login() rejects on failure
+          this._logDebug ? this._logDebug(`Login successful (attempt ${attempt})`) : this._logInfo("Login successful");
           this.loginPromise = null;
           return;
         } catch (err) {
           const msg = err && err.message ? err.message : String(err);
-          this.log(`Login fallito (attempt ${attempt}): ${msg}`);
-          // se è un errore di token, proviamo prima a refreshare il token (solo se abilitato)
-          const isTokenError = (err && err.code === 424) || (msg && msg.toLowerCase().includes("invalid device token")) || (msg && msg.toLowerCase().includes("invalid token"));
-          if (isTokenError && this.useTelnetForToken) {
+          this._logWarn(`Login failed (attempt ${attempt}): ${msg}`);
+
+          const isTokenErr = this._isTokenError(err);
+          if (isTokenErr && this.useTelnetForToken) {
+            // Try to recover token via telnet before next login attempt
             try {
-              this.log("Token non valido rilevato: provo a recuperare token via telnet...");
+              this._logDebug("Token error detected during login: fetching token from telnet...");
               const newToken = await this.client.getTokenFromTelnet();
               if (newToken) {
                 if (typeof this.client.setPin === 'function') {
                   this.client.setPin(newToken);
                 } else if (typeof this.client.updatePin === 'function') {
                   this.client.updatePin(newToken);
+                } else {
+                  this._logWarn("Client does not expose setPin/updatePin after telnet token fetch.");
                 }
-                this.log("Token aggiornato localmente. Ritento il login immediatamente.");
-                // subito riproviamo (non incrementare attempt oltre normale)
+                this._logDebug("Token refreshed locally, retrying login immediately.");
+                // Immediately retry without counting as extra attempt beyond normal loop iteration
                 continue;
               } else {
-                this.log("Recupero token via telnet non ha restituito token.");
+                this._logWarn("Telnet did not return a token during login recovery.");
               }
             } catch (telnetErr) {
-              this.log("Errore recupero token via telnet:", telnetErr && telnetErr.message ? telnetErr.message : telnetErr);
+              this._logWarn("Error fetching token via telnet during login recovery:", telnetErr && telnetErr.message ? telnetErr.message : telnetErr);
             }
           }
 
-          // backoff prima del prossimo tentativo
           if (attempt < this.maxRetries) {
-            this.log(`Attendo ${delay}ms prima del prossimo tentativo di login...`);
+            this._logDebug(`Waiting ${delay} ms before next login attempt`);
             await new Promise(res => setTimeout(res, delay));
-            delay = Math.min(delay * 2, 30000); // cap a 30s
+            delay = Math.min(delay * 2, 30000); // cap at 30s
             continue;
           } else {
-            // ultimo tentativo fallito -> gestiamo in modo più morbido
-            const e = new Error(`Login fallito dopo ${attempt} tentativi: ${msg}`);
-            // puliamo loginPromise prima di lanciare
+            // All attempts exhausted
+            const finalError = new Error(`Login failed after ${attempt} attempts: ${msg}`);
             this.loginPromise = null;
-            throw e;
+            this._logError(finalError.message);
+            throw finalError;
           }
         }
       }
+      // If shutdown requested
+      this.loginPromise = null;
+      throw new Error("Login aborted: shutting down or max retries exhausted");
     })();
 
     return this.loginPromise;
   }
 
-  // Tentativo di refresh token e riconnessione immediata (usato in gestione errori)
+  // Attempts to refresh token via telnet then re-initialize client and login
   async refreshTokenAndReconnect() {
     if (!this.useTelnetForToken) {
       throw new Error("refreshTokenAndReconnect called but useTelnetForToken is false");
     }
-    if (this.tokenUpdateInProgress) {
-      // Se già in corso, aspettiamo che finisca e poi tentiamo login
-      while (this.tokenUpdateInProgress) {
-        await new Promise(r => setTimeout(r, 200));
-      }
+
+    // Wait if periodic update is in progress
+    while (this.tokenUpdateInProgress) {
+      this._logDebug("Waiting for in-progress token update to finish...");
+      await new Promise(r => setTimeout(r, 200));
     }
+
     this.tokenUpdateInProgress = true;
     try {
+      this._logDebug("Refreshing token via telnet...");
       const newToken = await this.client.getTokenFromTelnet();
-      if (!newToken) throw new Error("Telnet did not return a new token");
+      if (!newToken) {
+        throw new Error("Telnet did not return a new token");
+      }
+
       if (typeof this.client.setPin === 'function') {
         this.client.setPin(newToken);
       } else if (typeof this.client.updatePin === 'function') {
         this.client.updatePin(newToken);
+      } else {
+        this._logWarn("Client does not allow setting token after telnet fetch.");
       }
-      this.log("Token aggiornato via telnet (non mostrato in log). Provo a riconnettere.");
-      // ricrea client pulito per evitare stato corrotto
+
+      this._logDebug("Token updated via telnet (not printed). Recreating client to ensure clean state.");
+
+      // Recreate client to avoid corrupted state; use same options (which include pin if client reads from it)
       this.client = new WebSocketClient(this.options);
+
+      // Try to connect now
       await this.ensureConnected();
+      this._logDebug("Reconnected after token refresh.");
     } finally {
       this.tokenUpdateInProgress = false;
     }
   }
 
-  // getServices rimane invariato nella API
+  // ---------- Homebridge accessory API ----------
   getServices() {
     this.service = new Service.Outlet(this.name);
     this.service.getCharacteristic(Characteristic.On)
       .on('get', this.getPowerState.bind(this))
       .on('set', this.setPowerState.bind(this));
+    // You could add other characteristics here (OutletInUse, etc.) if the device supports them
     return [this.service];
   }
 
+  // Helper to call a Homebridge callback safely (avoid double-calling)
+  _safeCallback(cb, err, val) {
+    try {
+      if (typeof cb === 'function') cb(err, val);
+    } catch (e) {
+      this._logWarn("Callback threw an exception:", e && e.message ? e.message : e);
+    }
+  }
+
+  // getPowerState: serialized via operation queue
   async getPowerState(callback) {
-    try {
-      await this.ensureConnected();
-      const state = await this.client.state();
-      this.log(`Current state of plug '${this.name}': ${state ? "On" : "Off"}`);
-      callback(null, state);
-    } catch (error) {
-      this.log("Error retrieving state:", error && error.message ? error.message : error);
-      const msg = error && error.message ? error.message : "";
-      const isTokenError = (error && error.code === 424) || (msg && msg.toLowerCase().includes("invalid device token")) || (msg && msg.toLowerCase().includes("invalid token"));
-      if (isTokenError && this.useTelnetForToken) {
-        this.log("Token non valido rilevato durante get: provo refresh token e retry");
-        try {
-          await this.refreshTokenAndReconnect();
-          const state = await this.client.state();
-          this.log(`Dopo refresh, stato plug '${this.name}': ${state ? "On" : "Off"}`);
-          callback(null, state);
-          return;
-        } catch (forcedError) {
-          this.log("Tentativo di refresh token/riconnessione fallito:", forcedError && forcedError.message ? forcedError.message : forcedError);
-          // fallback: se forziamo restart via config, facciamolo, altrimenti ritorniamo errore all'homebridge senza kill
-          if (this.forceRestartOnFailure) {
-            this.log("forceRestartOnFailure=true -> riavviando processo in 1s");
-            setTimeout(() => { process.exit(1); }, 1000);
+    // Enqueue the operation so concurrent gets/sets don't race
+    this._enqueueOperation(async () => {
+      try {
+        await this.ensureConnected();
+        const state = await this.client.state();
+        this._logDebug(`Current state for '${this.name}': ${state ? "On" : "Off"}`);
+        this._safeCallback(callback, null, state);
+      } catch (error) {
+        this._logWarn("Error retrieving state:", error && error.message ? error.message : error);
+        // token-specific recovery
+        if (this._isTokenError(error) && this.useTelnetForToken) {
+          this._logDebug("Token error detected during getPowerState: attempting refresh and retry");
+          try {
+            await this.refreshTokenAndReconnect();
+            const state = await this.client.state();
+            this._logDebug(`State after token refresh for '${this.name}': ${state ? "On" : "Off"}`);
+            this._safeCallback(callback, null, state);
+            return;
+          } catch (retryErr) {
+            this._logError("Token refresh + retry failed:", retryErr && retryErr.message ? retryErr.message : retryErr);
+            if (this.forceRestartOnFailure) {
+              this._logError("forceRestartOnFailure=true -> scheduling process exit in 1s");
+              setTimeout(() => process.exit(1), 1000);
+            }
+            this._safeCallback(callback, retryErr);
+            return;
           }
-          callback(forcedError);
-          return;
         }
-      } else {
-        this.log("Errore non correlato al token. Non riavvio immediatamente; ritorno errore a Homebridge.");
+
+        // Non-token-related error
         if (this.forceRestartOnFailure) {
-          this.log("forceRestartOnFailure=true -> riavviando processo in 1s");
-          setTimeout(() => { process.exit(1); }, 1000);
+          this._logError("forceRestartOnFailure=true -> scheduling process exit in 1s due to get error");
+          setTimeout(() => process.exit(1), 1000);
         }
-        callback(error);
+        this._safeCallback(callback, error);
       }
-    }
+    }).catch(queueErr => {
+      // if queue-level error happens
+      this._logError("Operation queue error on getPowerState:", queueErr && queueErr.message ? queueErr.message : queueErr);
+      this._safeCallback(callback, queueErr);
+    });
   }
 
+  // setPowerState: serialized via operation queue
   async setPowerState(value, callback) {
-    try {
-      await this.ensureConnected();
-      await this.client.switch(value);
-      this.log(`Setting plug '${this.name}' state to: ${value ? "On" : "Off"}`);
-      callback(null);
-    } catch (error) {
-      this.log("Error changing state:", error && error.message ? error.message : error);
-      const msg = error && error.message ? error.message : "";
-      const isTokenError = (error && error.code === 424) || (msg && msg.toLowerCase().includes("invalid device token")) || (msg && msg.toLowerCase().includes("invalid token"));
-      if (isTokenError && this.useTelnetForToken) {
-        // proviamo a refreshare il token e a ritentare una volta
-        this.log("Token non valido durante set: provo refresh token e retry");
-        try {
-          await this.refreshTokenAndReconnect();
-          await this.client.switch(value);
-          this.log(`Dopo refresh, set riuscito per '${this.name}'`);
-          callback(null);
-          return;
-        } catch (e) {
-          this.log("Retry dopo refresh token fallito:", e && e.message ? e.message : e);
-          if (this.forceRestartOnFailure) {
-            this.log("forceRestartOnFailure=true -> riavvio processo in 1s");
-            setTimeout(() => { process.exit(1); }, 1000);
+    this._enqueueOperation(async () => {
+      try {
+        await this.ensureConnected();
+        await this.client.switch(value);
+        this._logDebug(`Set plug '${this.name}' to: ${value ? "On" : "Off"}`);
+        this._safeCallback(callback, null);
+      } catch (error) {
+        this._logWarn("Error changing state:", error && error.message ? error.message : error);
+
+        if (this._isTokenError(error) && this.useTelnetForToken) {
+          // Try refresh once and retry the set
+          this._logDebug("Token error during setPowerState: attempting refresh and retry");
+          try {
+            await this.refreshTokenAndReconnect();
+            await this.client.switch(value);
+            this._logDebug(`Set succeeded after token refresh for '${this.name}'`);
+            this._safeCallback(callback, null);
+            return;
+          } catch (retryErr) {
+            this._logError("Retry after token refresh failed:", retryErr && retryErr.message ? retryErr.message : retryErr);
+            if (this.forceRestartOnFailure) {
+              this._logError("forceRestartOnFailure=true -> scheduling process exit in 1s");
+              setTimeout(() => process.exit(1), 1000);
+            }
+            this._safeCallback(callback, retryErr);
+            return;
           }
-          callback(e);
-          return;
         }
-      } else {
-        // Errore non token-related: non uccidiamo HB automaticamente, restituiamo errore
-        this.log("Errore non correlato al token durante set. Restituisco l'errore a Homebridge.");
+
+        // Non-token-related error: return to Homebridge (don't kill process unless forced)
         if (this.forceRestartOnFailure) {
-          this.log("forceRestartOnFailure=true -> riavvio processo in 1s");
-          setTimeout(() => { process.exit(1); }, 1000);
+          this._logError("forceRestartOnFailure=true -> scheduling process exit in 1s due to set error");
+          setTimeout(() => process.exit(1), 1000);
         }
-        callback(error);
+        this._safeCallback(callback, error);
       }
-    }
+    }).catch(queueErr => {
+      this._logError("Operation queue error on setPowerState:", queueErr && queueErr.message ? queueErr.message : queueErr);
+      this._safeCallback(callback, queueErr);
+    });
   }
 
+  // Graceful shutdown: cancel timers and close client if possible
   shutdown() {
     this.shutdownRequested = true;
-    this.clearTokenUpdateInterval();
-    // opzionale: chiudi client se c'è API per farlo
+    this._clearTokenUpdateInterval();
+    // If client supports close, attempt it
     if (this.client && typeof this.client.close === 'function') {
-      try { this.client.close(); } catch(e) { /* ignore */ }
+      try {
+        this.client.close();
+        this._logDebug("WebSocket client closed during shutdown");
+      } catch (e) {
+        this._logWarn("Error closing WebSocket client during shutdown:", e && e.message ? e.message : e);
+      }
     }
   }
 }
+
