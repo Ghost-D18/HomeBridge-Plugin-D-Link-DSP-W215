@@ -1,4 +1,4 @@
-# Homebridge D-Link DSP W215 Plugin
+# Homebridge D-Link DSP W215 Plugin v1.1
 
 ## WARNING!
 
@@ -6,41 +6,112 @@
 
 ## Overview
 
-This **Homebridge D-Link Plugin** enable you to integrate D-Link smart plug DSP W215 with Homebridge, enabling it to be controlled and monitoring its status. You can turn the smart plug on and off and check the status.
-The base of this plugin was given by this great guy @Garfonso: https://github.com/Garfonso/dlinkWebSocketClient. For configuration, problem or more details go to his git.
-The plugin use the telnet to get the token periodically in auto mode and because of an error, every time a specific token invalid error occur, the code try to get again the token. In fact you will see a lot of message in the consol, every time need to update the status of the plug. In some cases when other type of error occur, instead of blocking the plugin and so the plug isn't more accessible, the code restart whole Homebridge, like when you save the JSON config.
+This **Homebridge D-Link Plugin** integrates the D-Link smart plug DSP W215 with Homebridge, enabling on/off control and state reporting from HomeKit.
+This new version was made by **GPT 5**, and it's more optimized and efficient.
+This fork adds robust error handling, serialized operations, token-refresh logic (Telnet-based token retrieval when configured), and a configurable logging level.
+
+The original WebSocket client used as a base was created by @Garfonso: https://github.com/Garfonso/dlinkWebSocketClient. Consult their project for low-level details about the device protocol and token extraction.
+
+## Key Features 1.1.0 (what's new)
+
+- Centralized login with retries and exponential backoff.
+- Serialized get/set operations to avoid race conditions.
+- Periodic token refresh via Telnet (optional).
+- On-demand token refresh and reconnection when token-related errors occur.
+- Configurable debug flag: enable full verbose logging or keep only warnings/errors.
+- Softer restart policy: Homebridge process is not restarted automatically unless configured.
+- Child-bridge aware restart behaviour: plugin can restart only the child bridge or the entire Homebridge process depending on configuration.
+- Defensive programming to reduce unhandled rejections and unnecessary restarts.
 
 ## Configuration sample
-When you install the plugin, you have to manually write the config piece.
-This one is the base:
+
+Place the accessory inside the "accessories" array of your Homebridge config.json. Example:
 ```json
 {
-	"accessory": "DLinkSmartPlug",
-	"name": "NAME OF THE ACCESSORY",
-	"ip": "YOUR PLUG'S IP",
-	"pin": "TELNET",
-	"useTelnetForToken": true,
-	"simulateError": true
+  "platforms": [],
+  "accessories": [
+    {
+      "accessory": "DLinkSmartPlug",
+      "name": "Living Room Plug",
+      "ip": "192.168.1.50",
+      "pin": "TELNET",
+      "useTelnetForToken": true,
+      "debug": false,
+
+      "maxRetries": 5,
+      "initialRetryDelayMs": 1000,
+      "tokenUpdateIntervalMs": 300000,
+
+      "forceRestartOnFailure": false,
+      "childBridge": true
+    }
+  ]
 }
 ```
 
-**You have to modify ONLY "name" and "ip"**
+## Field description
 
--   `**name**`: The name you want to assign to the accessory.
--   `**ip**`: The local IP address of the D-Link smart plug.
--   `**pin**`: The Telnet PIN for authentication.
--   `**useTelnetForToken**`: Whether to use Telnet for token retrieval (default: `true`).
--   `**simulateError**`: If set to `true`, simulates an error for debugging purposes.
+- `accessory`: must be DLinkSmartPlug (plugin registration name).
+- `name`: friendly name shown in HomeKit.
+- `ip`: local IP address of the DSP W215 plug.
+- `pin`: device token or "TELNET" to indicate the plugin should fetch the token via Telnet client API.
+- `useTelnetForToken`: true to enable Telnet token retrieval (recommended if you don't have the static token).
+- `debug`: true to enable verbose logging (original behavior). Default: false (only warnings/errors printed).
+- `maxRetries`: maximum number of login attempts before deciding failure. Default: 5.
+- `initialRetryDelayMs`: initial backoff delay (ms) used for login retries. Default: 1000.
+- `tokenUpdateIntervalMs`: periodic token-refresh interval in milliseconds (only when useTelnetForToken=true). Default: 300000 (5 minutes).
+- `forceRestartOnFailure`: if true, on certain critical failures the plugin will schedule a process exit to restart (see below). Default: false.
+- `childBridge`: boolean override to indicate the accessory is running inside a child bridge. If present, this value is used; otherwise the plugin attempts a best-effort autodetection. Default: absent (autodetect -> false).
 
-## Cons
-
-- The plugin is not optmized at 100%, in fact it has some "problem". **The device must be configurated with token and not PIN** follow the guide on https://github.com/Garfonso/dlinkWebSocketClient, but with this configuration, you can control it through the official app.
-
-- You may not able to configure the smart plug correctly, in that case, go to the git linked and view some missing steps. In other case, get a little help by GPT (I was able to tell it to create a plugin, so you can resolve these problem I think).
+**I manage to work this plugin only with telnet and token "mode". So i recommend you to use it**
 
 
-## P.S.
-I'm missing something important to tell you probably.
-If you want to do some changes, you are free to do it.
-I don't think I'll update this plugin. For now, for me, for the things I've to do, it work well.
-Sorry for my english btw.
+## Critical failure / restart behavior
+
+To avoid uncontrolled Homebridge restarts, the plugin uses a configurable restart policy:
+
+- If a critical unrecoverable error occurs (e.g., repeated login failures or unrecoverable token refresh failure), the plugin will call the central handler _handleCriticalFailure(reason).
+- If childBridge: true (or autodetection indicates the plugin runs inside a child bridge), the plugin will schedule a child-bridge restart by exiting the process with code 2 (process.exit(2)), after a short delay. Many child-bridge managers will restart the bridge process when it exits; if yours does not, prefer to configure childBridge: true and your process manager accordingly.
+- If not running as child bridge and forceRestartOnFailure: true, the plugin will schedule a full Homebridge restart by exiting with code 1 (process.exit(1)).
+- If neither condition is true, the plugin logs the error and remains loaded (best-effort degraded mode), avoiding killing Homebridge.
+
+**Recommendation:** If you run the accessory inside Homebridge's child-bridge mode (a separate process), set `childBridge: true` explicitly in the config to make the restart behavior deterministic.
+
+## Logging & Debugging
+
+`debug: true` — verbose mode. All original informational messages (state changes, token refresh attempts, retries, etc.) will be printed.
+
+`debug: false` — quiet mode. Only warnings and errors are logged (recommended for production).
+
+**Tokens and sensitive values are never printed to logs**
+
+Each log line includes the accessory context where possible. If you want more custom formatting (timestamps, accessory prefix), you can adapt the logging helper in index.js.
+
+
+## Token handling (Telnet)
+
+When useTelnetForToken is enabled the plugin will:
+
+- attempt to periodically fetch a fresh token using the client's getTokenFromTelnet() method (every tokenUpdateIntervalMs ms).
+- attempt a token refresh when a token-related error is detected (error code 424 or messages like "invalid token" or "token expired").
+- update the client's PIN/token via setPin() or updatePin() if the client exposes those APIs.
+- recreate the WebSocket client after token refresh to avoid stale/corrupted runtime state.
+
+Note: The plugin intentionally avoids printing token values to logs.
+
+## Limitations & Known issues
+
+- The plugin delegates low-level device interaction to dlink_websocketclient. For device-specific setup and token extraction details, consult the original project.
+- Child-bridge detection is best-effort; for fully predictable behavior prefer to explicitly set childBridge: true or false in config.
+- The restart behavior depends on the environment and process manager; the plugin only signals via process.exit(...), it cannot control external process managers.
+
+
+## Credits
+
+*dlink_websocketclient by @Garfonso — the underlying implementation for interacting with the D-Link device*
+
+*This plugin code and README were generated and refined with the assistance of ChatGPT and then supervised by the maintainer*
+
+## License & Disclaimer
+
+This plugin is provided as-is. Use at your own risk. The author and contributors take no responsibility for bricked devices, data loss, or other issues resulting from use of this plugin. Review the original dlink_websocketclient license for low-level client licensing.
