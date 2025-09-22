@@ -1,17 +1,12 @@
-// homebridge-dlink-wifi-smart-plug-dsp-w215 (optimized + child-bridge aware restart handling)
-// All comments and code are in English per your request. Logging helpers and debug flag included.
-// New behavior:
-// - if a critical, unrecoverable error occurs and the accessory is running as a child-bridge,
-//   the plugin will schedule a process exit that should restart the bridge only (exit code 2).
-// - if not a child-bridge and forceRestartOnFailure === true, the plugin will schedule a process exit
-//   that restarts the whole Homebridge process (exit code 1).
-// - autodetection of child-bridge with explicit override via config.childBridge.
+// homebridge-dlink-wifi-smart-plug-dsp-w215 (updated)
+// - Adds operationTimeoutMs for get/set to avoid Homebridge blocking/warnings
+// - Suppresses verbose token error messages when debug=false (compact message instead)
+// - Preserves prior improvements: serialized login, token refresh, child-bridge aware restart, queueing, etc.
 
 const WebSocketClient = require('dlink_websocketclient');
 let Service, Characteristic, HOMEBRIDGE_API;
 
 module.exports = (homebridge) => {
-  // capture homebridge API for possible autodetection of child bridge
   HOMEBRIDGE_API = homebridge;
   Service = homebridge.hap.Service;
   Characteristic = homebridge.hap.Characteristic;
@@ -20,31 +15,31 @@ module.exports = (homebridge) => {
 
 class DLinkSmartPlug {
   constructor(log, config = {}) {
-    // Basic identity & options
+    // Basic identity
     this.log = log;
     this.name = config.name || "D-Link Smart Plug";
     this.ip = config.ip;
-    this.pin = config.pin; // token or "TELNET"
+    this.pin = config.pin;
     this.useTelnetForToken = !!config.useTelnetForToken;
 
+    // Options forwarded to client
     this.options = {
       ip: this.ip,
       pin: this.pin,
       useTelnetForToken: this.useTelnetForToken
     };
 
+    // Retry / timing config
     this.maxRetries = Number.isInteger(config.maxRetries) ? config.maxRetries : 5;
     this.initialRetryDelayMs = Number.isInteger(config.initialRetryDelayMs) ? config.initialRetryDelayMs : 1000;
     this.tokenUpdateIntervalMs = Number.isInteger(config.tokenUpdateIntervalMs) ? config.tokenUpdateIntervalMs : 300000;
-    this.forceRestartOnFailure = !!config.forceRestartOnFailure;
+    this.operationTimeoutMs = Number.isInteger(config.operationTimeoutMs) ? config.operationTimeoutMs : 5000; // NEW: timeout for get/set
 
-    // Debug flag: verbose logging if true
+    // Restart behaviour and logging
+    this.forceRestartOnFailure = !!config.forceRestartOnFailure;
     this.debug = !!config.debug;
 
-    // Child-bridge handling:
-    // 1) explicit override via config.childBridge (true/false)
-    // 2) try to autodetect via HOMEBRIDGE_API if available
-    // 3) fallback false
+    // Child-bridge detection (explicit override or best-effort autodetect)
     this.runningAsChildBridge = false;
     if (typeof config.childBridge === 'boolean') {
       this.runningAsChildBridge = config.childBridge;
@@ -53,14 +48,11 @@ class DLinkSmartPlug {
         if (HOMEBRIDGE_API && typeof HOMEBRIDGE_API.isChildBridge === 'boolean') {
           this.runningAsChildBridge = HOMEBRIDGE_API.isChildBridge;
         } else if (HOMEBRIDGE_API && HOMEBRIDGE_API.server && typeof HOMEBRIDGE_API.server.name === 'string') {
-          // heuristic: some child bridge server names contain 'child' or 'bridge'
           const sn = HOMEBRIDGE_API.server.name.toLowerCase();
           if (sn.includes('child') || sn.includes('bridge')) this.runningAsChildBridge = true;
         }
-        // environment heuristic (rare): some setups export a child flag
         if (!this.runningAsChildBridge && process.env.HOMEBRIDGE_CHILD === '1') this.runningAsChildBridge = true;
       } catch (e) {
-        // ignore detection errors and default to false
         this.runningAsChildBridge = false;
       }
     }
@@ -68,15 +60,13 @@ class DLinkSmartPlug {
     // Internal state
     this.client = new WebSocketClient(this.options);
     this.shutdownRequested = false;
-    this.loginPromise = null;
+    this.loginPromise = null; // serializes login attempts
     this.tokenUpdateInProgress = false;
     this.tokenUpdateInterval = null;
-    this._opQueue = Promise.resolve(); // serialized operation queue
+    this._opQueue = Promise.resolve(); // operation queue
 
-    // Start periodic token refresh only if telnet-based token retrieval is enabled
-    if (this.useTelnetForToken) {
-      this._startTokenUpdateInterval();
-    }
+    // Start periodic token update if telnet token usage is enabled
+    if (this.useTelnetForToken) this._startTokenUpdateInterval();
 
     this._logInfo(`Initializing '${this.name}' ip=${this.ip} childBridge=${this.runningAsChildBridge} telnetToken=${this.useTelnetForToken}`);
   }
@@ -110,34 +100,23 @@ class DLinkSmartPlug {
   }
 
   // ---------- Critical failure handler ----------
-  // This centralizes the restart behavior:
-  // - if running as child bridge -> exit with code 2 (often triggers bridge restart)
-  // - else if not child bridge and forceRestartOnFailure -> exit with code 1 (to restart Homebridge)
-  // - else: log and do not exit
   _handleCriticalFailure(reason) {
     const msg = reason && (reason.message || reason.toString()) ? (reason.message || reason.toString()) : String(reason);
     this._logError("CRITICAL: unrecoverable error:", msg);
 
     if (this.runningAsChildBridge) {
-      // try to restart only the bridge (exit code 2 chosen as conventional distinct code)
       this._logError("Accessory configured as child-bridge -> scheduling child-bridge restart (exit 2) in 1s");
-      setTimeout(() => {
-        try { process.exit(2); } catch (e) { /* best effort */ }
-      }, 1000);
+      setTimeout(() => { try { process.exit(2); } catch (e) {} }, 1000);
       return;
     }
 
     if (this.forceRestartOnFailure) {
-      // restart entire Homebridge process
       this._logError("forceRestartOnFailure=true -> scheduling full Homebridge restart (exit 1) in 1s");
-      setTimeout(() => {
-        try { process.exit(1); } catch (e) { /* best effort */ }
-      }, 1000);
+      setTimeout(() => { try { process.exit(1); } catch (e) {} }, 1000);
       return;
     }
 
-    // If not child-bridge and not forcing restart, just log and avoid killing the process
-    this._logWarn("Not configured to restart (neither childBridge nor forceRestartOnFailure). Plugin will remain loaded but in error state.");
+    this._logWarn("Not configured to restart (neither childBridge nor forceRestartOnFailure). Plugin will remain loaded but in degraded mode.");
   }
 
   // ---------- Operation queue ----------
@@ -146,23 +125,21 @@ class DLinkSmartPlug {
       if (this.shutdownRequested) return Promise.reject(new Error("Accessory shutting down"));
       return fn();
     }).catch(err => {
+      // keep chain alive but forward rejection
       return Promise.reject(err);
     });
     return this._opQueue;
   }
 
-  // ---------- Token interval management ----------
+  // ---------- Token refresh interval ----------
   _startTokenUpdateInterval() {
     if (this.tokenUpdateInterval) return;
     this.tokenUpdateInterval = setInterval(async () => {
       if (this.shutdownRequested) return;
-      if (this.tokenUpdateInProgress) {
-        this._logDebug("Periodic token update skipped: in progress");
-        return;
-      }
+      if (this.tokenUpdateInProgress) { this._logDebug("Periodic token update skipped: already in progress"); return; }
       this.tokenUpdateInProgress = true;
       try {
-        this._logDebug("Periodic token update: fetching token via telnet...");
+        this._logDebug("Periodic token update: fetching token from telnet...");
         const newToken = await this.client.getTokenFromTelnet();
         if (newToken) {
           if (typeof this.client.setPin === 'function') {
@@ -170,11 +147,11 @@ class DLinkSmartPlug {
           } else if (typeof this.client.updatePin === 'function') {
             this.client.updatePin(newToken);
           } else {
-            this._logWarn("Client does not support setPin/updatePin");
+            this._logWarn("Client does not expose setPin/updatePin to update token.");
           }
-          this._logDebug("Periodic token updated (not printed)");
+          this._logDebug("Periodic token update: token updated (not shown).");
         } else {
-          this._logWarn("Periodic token update: telnet returned no token");
+          this._logWarn("Periodic token update: telnet did not return a token.");
         }
       } catch (err) {
         this._logWarn("Periodic token update error:", err && err.message ? err.message : err);
@@ -196,7 +173,7 @@ class DLinkSmartPlug {
     if (this.shutdownRequested) throw new Error("Accessory shutting down");
 
     if (this.loginPromise) {
-      this._logDebug("Awaiting ongoing login attempt");
+      this._logDebug("Login already in progress, awaiting existing promise");
       return this.loginPromise;
     }
 
@@ -217,9 +194,8 @@ class DLinkSmartPlug {
           this._logWarn(`Login failed (attempt ${attempt}): ${msg}`);
 
           if (this._isTokenError(err) && this.useTelnetForToken) {
-            // try to recover token via telnet before next attempt
             try {
-              this._logDebug("Token error detected during login -> fetching token via telnet");
+              this._logDebug("Token error detected during login: fetching token via telnet...");
               const newToken = await this.client.getTokenFromTelnet();
               if (newToken) {
                 if (typeof this.client.setPin === 'function') {
@@ -227,13 +203,13 @@ class DLinkSmartPlug {
                 } else if (typeof this.client.updatePin === 'function') {
                   this.client.updatePin(newToken);
                 }
-                this._logDebug("Token updated locally, retrying login immediately");
-                continue; // retry immediately within loop
+                this._logDebug("Token refreshed locally, retrying login immediately.");
+                continue;
               } else {
-                this._logWarn("Telnet did not return token during login recovery");
+                this._logWarn("Telnet did not return a token during login recovery.");
               }
             } catch (telnetErr) {
-              this._logWarn("Error fetching telnet token during login recovery:", telnetErr && telnetErr.message ? telnetErr.message : telnetErr);
+              this._logWarn("Error fetching token via telnet during login recovery:", telnetErr && telnetErr.message ? telnetErr.message : telnetErr);
             }
           }
 
@@ -246,7 +222,6 @@ class DLinkSmartPlug {
             const finalError = new Error(`Login failed after ${attempt} attempts: ${msg}`);
             this.loginPromise = null;
             this._logError(finalError.message);
-            // Consider this a critical failure condition — handle according to configuration
             this._handleCriticalFailure(finalError);
             throw finalError;
           }
@@ -279,16 +254,14 @@ class DLinkSmartPlug {
       } else if (typeof this.client.updatePin === 'function') {
         this.client.updatePin(newToken);
       } else {
-        this._logWarn("Client does not provide pin setter after telnet");
+        this._logWarn("Client does not allow setting token after telnet fetch.");
       }
 
-      // Recreate client to avoid stale/corrupted state and attempt connect
       this.client = new WebSocketClient(this.options);
       await this.ensureConnected();
-      this._logDebug("Reconnected after token refresh");
+      this._logDebug("Reconnected after token refresh.");
     } catch (err) {
       this._logError("refreshTokenAndReconnect failed:", err && err.message ? err.message : err);
-      // Consider failure to refresh token a critical condition
       this._handleCriticalFailure(err);
       throw err;
     } finally {
@@ -306,100 +279,197 @@ class DLinkSmartPlug {
   }
 
   _safeCallback(cb, err, val) {
-    try { if (typeof cb === 'function') cb(err, val); } catch (e) { this._logWarn("Callback threw:", e && e.message ? e.message : e); }
+    try { if (typeof cb === 'function') cb(err, val); } catch (e) { this._logWarn("Callback threw an exception:", e && e.message ? e.message : e); }
   }
 
+  // ---------- getPowerState with operation timeout and token-suppressed logging ----------
   async getPowerState(callback) {
+    let responded = false;
+    const timeoutMs = this.operationTimeoutMs || 5000;
+
+    const timeoutHandle = setTimeout(() => {
+      responded = true;
+      const err = new Error(`Timeout: device did not respond within ${timeoutMs}ms`);
+      this._logWarn("getPowerState timed out:", err.message);
+      this._safeCallback(callback, err);
+    }, timeoutMs);
+
     this._enqueueOperation(async () => {
       try {
         await this.ensureConnected();
         const state = await this.client.state();
-        this._logDebug(`getPowerState: ${state ? "ON" : "OFF"}`);
-        this._safeCallback(callback, null, state);
-      } catch (error) {
-        this._logWarn("getPowerState error:", error && error.message ? error.message : error);
+        this._logDebug(`getPowerState actual result: ${state ? "ON" : "OFF"}`);
 
-        if (this._isTokenError(error) && this.useTelnetForToken) {
-          this._logDebug("Token error in getPowerState -> attempting refresh+retry");
-          try {
-            await this.refreshTokenAndReconnect();
-            const state = await this.client.state();
-            this._logDebug(`getPowerState after refresh: ${state ? "ON" : "OFF"}`);
-            this._safeCallback(callback, null, state);
-            return;
-          } catch (retryErr) {
-            this._logError("Retry after token refresh failed in getPowerState:", retryErr && retryErr.message ? retryErr.message : retryErr);
-            // If refresh retry fails, handle as critical depending on configuration
-            this._handleCriticalFailure(retryErr);
-            this._safeCallback(callback, retryErr);
+        if (!responded) {
+          clearTimeout(timeoutHandle);
+          responded = true;
+          this._safeCallback(callback, null, state);
+        } else {
+          this._logDebug("getPowerState response arrived after timeout; ignoring callback.");
+        }
+      } catch (error) {
+        if (this._isTokenError(error)) {
+          // Token errors: show compact message when debug=false; full details only when debug=true
+          if (this.debug) {
+            this._logWarn("getPowerState error (token):", error && error.message ? error.message : error);
+          } else {
+            this._logWarn("getPowerState error: token invalid (enable debug for details)");
+            this._logDebug("getPowerState token error details:", error && error.message ? error.message : error);
+          }
+
+          if (!responded) {
+            try {
+              await this.refreshTokenAndReconnect();
+              const state = await this.client.state();
+              if (!responded) {
+                clearTimeout(timeoutHandle);
+                responded = true;
+                this._safeCallback(callback, null, state);
+              }
+              return;
+            } catch (retryErr) {
+              if (this.debug) {
+                this._logError("getPowerState: token refresh+retry failed:", retryErr && retryErr.message ? retryErr.message : retryErr);
+              } else {
+                this._logWarn("getPowerState: token refresh failed (enable debug for details)");
+                this._logDebug("getPowerState token refresh error details:", retryErr && retryErr.message ? retryErr.message : retryErr);
+              }
+              if (!responded) {
+                clearTimeout(timeoutHandle);
+                responded = true;
+                this._safeCallback(callback, retryErr);
+              }
+              return;
+            }
+          } else {
+            this._logDebug("getPowerState token error occurred after callback timeout; background recovery attempted.");
             return;
           }
+        } else {
+          // Non-token error
+          this._logWarn("getPowerState error:", error && error.message ? error.message : error);
+          if (!responded) {
+            clearTimeout(timeoutHandle);
+            responded = true;
+            if (this.forceRestartOnFailure) {
+              this._logError("getPowerState non-token error and forceRestartOnFailure=true -> escalate");
+              this._handleCriticalFailure(error);
+            }
+            this._safeCallback(callback, error);
+          } else {
+            this._logDebug("Non-token error occurred after timeout; ignored.");
+          }
         }
-
-        // Non-token error: if configured to force restart, escalate; else return error gracefully
-        if (this.forceRestartOnFailure) {
-          this._logError("getPowerState encountered non-token error and forceRestartOnFailure=true -> escalating");
-          this._handleCriticalFailure(error);
-        }
-        this._safeCallback(callback, error);
       }
     }).catch(queueErr => {
-      this._logError("Operation queue error in getPowerState:", queueErr && queueErr.message ? queueErr.message : queueErr);
-      this._safeCallback(callback, queueErr);
+      clearTimeout(timeoutHandle);
+      if (!responded) {
+        responded = true;
+        this._logError("Operation queue error in getPowerState:", queueErr && queueErr.message ? queueErr.message : queueErr);
+        this._safeCallback(callback, queueErr);
+      }
     });
   }
 
+  // ---------- setPowerState with operation timeout and token-suppressed logging ----------
   async setPowerState(value, callback) {
+    let responded = false;
+    const timeoutMs = this.operationTimeoutMs || 5000;
+
+    const timeoutHandle = setTimeout(() => {
+      responded = true;
+      const err = new Error(`Timeout: device did not respond within ${timeoutMs}ms`);
+      this._logWarn("setPowerState timed out:", err.message);
+      this._safeCallback(callback, err);
+    }, timeoutMs);
+
     this._enqueueOperation(async () => {
       try {
         await this.ensureConnected();
         await this.client.switch(value);
-        this._logDebug(`setPowerState -> ${value ? "ON" : "OFF"}`);
-        this._safeCallback(callback, null);
-      } catch (error) {
-        this._logWarn("setPowerState error:", error && error.message ? error.message : error);
+        this._logDebug(`setPowerState actual success -> ${value ? "ON" : "OFF"}`);
 
-        if (this._isTokenError(error) && this.useTelnetForToken) {
-          this._logDebug("Token error in setPowerState -> attempting refresh+retry");
-          try {
-            await this.refreshTokenAndReconnect();
-            await this.client.switch(value);
-            this._logDebug("setPowerState success after token refresh");
-            this._safeCallback(callback, null);
-            return;
-          } catch (retryErr) {
-            this._logError("Retry after token refresh failed in setPowerState:", retryErr && retryErr.message ? retryErr.message : retryErr);
-            this._handleCriticalFailure(retryErr);
-            this._safeCallback(callback, retryErr);
+        if (!responded) {
+          clearTimeout(timeoutHandle);
+          responded = true;
+          this._safeCallback(callback, null);
+        } else {
+          this._logDebug("setPowerState succeeded after timeout; ignoring callback.");
+        }
+      } catch (error) {
+        if (this._isTokenError(error)) {
+          if (this.debug) {
+            this._logWarn("setPowerState error (token):", error && error.message ? error.message : error);
+          } else {
+            this._logWarn("setPowerState error: token invalid (enable debug for details)");
+            this._logDebug("setPowerState token error details:", error && error.message ? error.message : error);
+          }
+
+          if (!responded) {
+            try {
+              await this.refreshTokenAndReconnect();
+              await this.client.switch(value);
+              if (!responded) {
+                clearTimeout(timeoutHandle);
+                responded = true;
+                this._safeCallback(callback, null);
+              }
+              return;
+            } catch (retryErr) {
+              if (this.debug) {
+                this._logError("setPowerState: retry after token refresh failed:", retryErr && retryErr.message ? retryErr.message : retryErr);
+              } else {
+                this._logWarn("setPowerState: token retry failed (enable debug for details)");
+                this._logDebug("setPowerState token retry details:", retryErr && retryErr.message ? retryErr.message : retryErr);
+              }
+              if (!responded) {
+                clearTimeout(timeoutHandle);
+                responded = true;
+                this._safeCallback(callback, retryErr);
+              }
+              return;
+            }
+          } else {
+            this._logDebug("setPowerState token error occurred after callback timeout; background retry in progress.");
             return;
           }
+        } else {
+          // Non-token error
+          this._logWarn("setPowerState error:", error && error.message ? error.message : error);
+          if (!responded) {
+            clearTimeout(timeoutHandle);
+            responded = true;
+            if (this.forceRestartOnFailure) {
+              this._logError("setPowerState non-token error and forceRestartOnFailure=true -> escalate");
+              this._handleCriticalFailure(error);
+            }
+            this._safeCallback(callback, error);
+          } else {
+            this._logDebug("Non-token setPowerState error occurred after timeout; ignored.");
+          }
         }
-
-        if (this.forceRestartOnFailure) {
-          this._logError("setPowerState encountered non-token error and forceRestartOnFailure=true -> escalating");
-          this._handleCriticalFailure(error);
-        }
-        this._safeCallback(callback, error);
       }
     }).catch(queueErr => {
-      this._logError("Operation queue error in setPowerState:", queueErr && queueErr.message ? queueErr.message : queueErr);
-      this._safeCallback(callback, queueErr);
+      clearTimeout(timeoutHandle);
+      if (!responded) {
+        responded = true;
+        this._logError("Operation queue error in setPowerState:", queueErr && queueErr.message ? queueErr.message : queueErr);
+        this._safeCallback(callback, queueErr);
+      }
     });
   }
 
-  // Graceful shutdown helper
+  // ---------- Shutdown ----------
   shutdown() {
     this.shutdownRequested = true;
     this._clearTokenUpdateInterval();
     if (this.client && typeof this.client.close === 'function') {
       try {
         this.client.close();
-        this._logDebug("Client closed on shutdown");
+        this._logDebug("WebSocket client closed during shutdown");
       } catch (e) {
-        this._logWarn("Error closing client on shutdown:", e && e.message ? e.message : e);
+        this._logWarn("Error closing WebSocket client during shutdown:", e && e.message ? e.message : e);
       }
     }
   }
 }
-
-module.exports.DLinkSmartPlug = DLinkSmartPlug;
