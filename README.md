@@ -41,6 +41,7 @@ Place the accessory inside the "accessories" array of your Homebridge config.jso
       "maxRetries": 5,
       "initialRetryDelayMs": 1000,
       "tokenUpdateIntervalMs": 300000,
+      "operationTimeoutMs": 5000,
 
       "forceRestartOnFailure": false,
       "childBridge": true
